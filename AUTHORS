@@ -1,8 +1,32 @@
-Chris Jones <cmsj@tenshu.net>
+Upstream Authors (in no discernible order):
 
-Draws heavily from the example python-vte code and the gedit terminal plugin.
+    Chris Jones
+    Huang He
+    Kees Cook
+    Thomas Meire
+    Nicolas Valcarcel
+    Emmanuel Bretelle
+    Chris Oattes
+    Markus Korn
+    Mackenzie Morgan
+    Daniel T Chen
+    Nicolas Roman
+    Takao Fujiwara
+    Jordan Callicoat
+    Stephen Boddy
+    Bryce Harrington
 
-Most excellent patches have been gratefully received from:
- o Huang He
- o Kees Cook
- o Thomas Meire
+Artwork:
+    Cory Kontros - Produced our current icon under the CC-by-SA licence
+    Cristian Grada - Drew our original icon and licenced it to us under GPL
+
+Translations:
+    Thomas Meire
+    Maxim Derkach
+    Nicolas Valcárcel
+    Mats Henrikson
+    Nizar Kerkeni
+    "Data"
+    Cristian Grada
+    "zhuqin"
+    and many others.

@@ -1,6 +1,6 @@
-#!/usr/bin/python
+#!/usr/bin/env python2
 #    Terminator - multiple gnome terminals in one window
-#    Copyright (C) 2006-2007  cmsj@tenshu.net
+#    Copyright (C) 2006-2010  cmsj@tenshu.net
 #
 #    This program is free software; you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -13,628 +13,129 @@
 #
 #    You should have received a copy of the GNU General Public License
 #    along with this program; if not, write to the Free Software
-#    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+#    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  
+#    USA
 
-"""Terminator by Chris Jones <cmsj@tenshu.net>
+"""Terminator by Chris Jones <cmsj@tenshu.net>"""
 
-Usage: terminator [OPTION] ...
-  -h, --help              Show this usage information
-  -d, --debug             Enable debugging
-  -m, --maximise          Maximise the terminator window when it starts
-  -f, --fullscreen        Place the window in its fullscreen state when it starts
-  -p, --profile=PROFILE   Take settings from gnome-terminal profile PROFILE
-"""
-
-import os
-import pwd
 import sys
-import string
-import gobject
-import gtk
+import os
+import psutil
+import pwd
 try:
-  import vte
-except:
-  print '''You need to install python bindings for libvte ("python-vte" in debian/ubuntu)'''
-  sys.exit (1)
-import gconf
-import pango
-import gnome
-import time
-import getopt
-import math
-import gettext
-
-class TerminatorTerm:
-
-  # Our settings
-  # FIXME: Add commandline and/or gconf options to change these
-  defaults = {
-    'gt_dir'                : '/apps/gnome-terminal',
-    '_profile_dir'           : '%s/profiles',
-    'allow_bold'            : True,
-    'audible_bell'          : False,
-    'background'            : None,
-    'background_color'      : '#000000',
-    'backspace_binding'     : 'ascii-del',
-    'delete_binding'        : 'delete-sequence',
-    'cursor_blinks'         : False,
-    'emulation'             : 'xterm',
-    'font_name'             : 'Serif 10',
-    'foreground_color'      : '#AAAAAA',
-    'scrollbar'             : True,
-    'scroll_on_keystroke'   : False,
-    'scroll_on_output'      : False,
-    'scrollback_lines'      : 100,
-    'focus'                 : 'sloppy',
-    'visible_bell'          : False,
-    'child_restart'         : True,
-    'link_scheme'           : '(news|telnet|nttp|file|http|ftp|https)',
-    '_link_user'            : '[%s]+(:[%s]+)?',
-    'link_hostchars'        : '-A-Za-z0-9',
-    'link_userchars'        : '-A-Za-z0-9',
-    'link_passchars'        : '-A-Za-z0-9,?;.:/!%$^*&~"#\'',
-    '_palette'               : '%s/palette',
-    'word_chars'            : '-A-Za-z0-9,./?%&#:_',
-    'mouse_autohide'        : True,
-  }
-
-  matches = {}
-
-  def __init__ (self, term, profile):
-    self.defaults['profile_dir'] = self.defaults['_profile_dir']%(self.defaults['gt_dir'])
-    self.defaults['link_user'] = self.defaults['_link_user']%(self.defaults['link_userchars'], self.defaults['link_passchars'])
-
-    self.term = term
-    self.gconf_client = gconf.client_get_default ()
-
-    self.profile = None
-    profiles = self.gconf_client.get_list (self.defaults['gt_dir'] + '/global/profile_list', 'string')
-
-    for item in profiles:
-      if item == profile:
-        self.profile = '%s/%s'%(self.defaults['profile_dir'], item)
-        break
-
-    if self.profile == None:
-      print "Error, unable to find profile " + profile
-      # FIXME: This absolutely should not be an exit, the terminal should fail to spawn. If they all fail, it should exit from the mainloop or something.
-      sys.exit (2)
-
-    self.defaults['palette'] = self.defaults['_palette']%(self.profile)
-
-    self.gconf_client.add_dir (self.profile, gconf.CLIENT_PRELOAD_RECURSIVE)
-    self.gconf_client.add_dir ('/apps/metacity/general', gconf.CLIENT_PRELOAD_RECURSIVE)
-
-    self.clipboard = gtk.clipboard_get (gtk.gdk.SELECTION_CLIPBOARD)
-
-    self._vte = vte.Terminal ()
-    self._vte.set_size (80, 24)
-    self.reconfigure_vte ()
-    self._vte.show ()
-
-    self._box = gtk.HBox ()
-    self._scrollbar = gtk.VScrollbar (self._vte.get_adjustment ())
-    if self.defaults['scrollbar']:
-      self._scrollbar.show ()
-
-    self._box.pack_start (self._vte)
-    self._box.pack_start (self._scrollbar, False)
-
-    self.gconf_client.notify_add (self.profile, self.on_gconf_notification)
-    self.gconf_client.notify_add ('/apps/metacity/general/focus_mode', self.on_gconf_notification)
-
-    self._vte.connect ("key-press-event", self.on_vte_key_press)
-    self._vte.connect ("button-press-event", self.on_vte_button_press)
-    self._vte.connect ("popup-menu", self.on_vte_popup_menu)
-
-    exit_action = self.gconf_client.get_string (self.profile + "/exit_action")
-    if exit_action == "restart":
-      self._vte.connect ("child-exited", self.spawn_child)
-    if exit_action == "close":
-      self._vte.connect ("child-exited", lambda close_term: self.term.closeterm (self))
-
-    self._vte.add_events (gtk.gdk.ENTER_NOTIFY_MASK)
-    self._vte.connect ("enter_notify_event", self.on_vte_notify_enter)
-
-    self.matches['domain'] = self._vte.match_add ('((%s://(%s@)?)|(www|ftp)[%s]*\\.)[%s.]+(:[0-9]*)?'%(self.defaults['link_scheme'], self.defaults['link_user'], self.defaults['link_hostchars'], self.defaults['link_hostchars']))
-    self.matches['path'] = self._vte.match_add ('((%s://(%s@)?)|(www|ftp)[%s]*\\.)[%s.]+(:[0-9]+)?/[-A-Za-z0-9_$.+!*(),;:@&=?/~#%%]*[^]\'.}>) \t\r\n,\\\]'%(self.defaults['link_scheme'], self.defaults['link_userchars'], self.defaults['link_hostchars'], self.defaults['link_hostchars']))
-    self.matches['email'] = self._vte.match_add ('(mailto:)?[a-z0-9][a-z0-9.-]*@[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+')
-
-    self.spawn_child ()
-
-  def spawn_child (self, event=None):
-    update_records = self.gconf_client.get_bool (self.profile + "/update_records") or True
-    login = self.gconf_client.get_bool (self.profile + "/login_shell") or False
-
-    if self.gconf_client.get_bool (self.profile + "/use_custom_command") == True:
-      args = self.gconf_client.get_string (self.profile + "/custom_command").split ()
-      shell = args[0]
-    else:
-      shell = pwd.getpwuid (os.getuid ())[6]
-      args = [os.path.basename (shell)]
-
-    self._vte.fork_command (command = shell, argv = args, envv = [], loglastlog = login, logwtmp = update_records, logutmp = update_records)
-
-  def reconfigure_vte (self):
-    # Set our emulation
-    self._vte.set_emulation (self.defaults['emulation'])
-
-    # Set our wordchars
-    word_chars = self.gconf_client.get_string (self.profile + "/word_chars" or self.defaults['word_chars'])
-    self._vte.set_word_chars (word_chars)
-
-    # Set our mouselation
-    self._vte.set_mouse_autohide (self.defaults['mouse_autohide'])
-
-    # Set our compatibility
-    backspace = self.gconf_client.get_string (self.profile + "/backspace_binding") or self.defaults['backspace_binding']
-    delete = self.gconf_client.get_string (self.profile + "/delete_binding") or self.defaults['delete_binding']
-
-# Note, each of the 4 following comments should replace the line beneath it, but the python-vte bindings don't appear to support this constant, so the magic values are being assumed from the C enum :/
-    if backspace == "ascii-del":
-#      backbind = vte.ERASE_ASCII_BACKSPACE
-      backbind = 2
-    else:
-#      backbind = vte.ERASE_AUTO_BACKSPACE
-      backbind = 1
-
-    if delete == "escape-sequence":
-#      delbind = vte.ERASE_DELETE_SEQUENCE
-      delbind = 3
-    else:
-#      delbind = vte.ERASE_AUTO
-      delbind = 0
-
-    self._vte.set_backspace_binding (backbind)
-    self._vte.set_delete_binding (delbind)
-
-    # Set our font, preferably from gconf settings
-    if self.gconf_client.get_bool (self.profile + "/use_system_font"):
-      font_name = (self.gconf_client.get_string ("/desktop/gnome/interface/monospace_font_name") or self.defaults['font_name'])
-    else:
-      font_name = (self.gconf_client.get_string (self.profile + "/font") or self.defaults['font_name'])
-
-    try:
-      self._vte.set_font (pango.FontDescription (font_name))
-    except:
-      pass
-
-    # Set our boldness
-    self._vte.set_allow_bold (self.gconf_client.get_bool (self.profile + "/allow_bold") or self.defaults['allow_bold'])
-
-    # Set our color scheme, preferably from gconf settings
-    palette = self.gconf_client.get_string (self.profile + "/palette") or self.defaults['palette']
-    if self.gconf_client.get_bool (self.profile + "/use_theme_colors") == True:
-      fg_color = self._vte.get_style ().text[gtk.STATE_NORMAL]
-      bg_color = self._vte.get_style ().base[gtk.STATE_NORMAL]
-    else:
-      fg_color = gtk.gdk.color_parse (self.gconf_client.get_string (self.profile + "/foreground_color") or self.defaults['foreground_color'])
-      bg_color = gtk.gdk.color_parse (self.gconf_client.get_string (self.profile + "/background_color") or self.defaults['background_color'])
-
-    colors = palette.split (':')
-    palette = []
-    for color in colors:
-      palette.append (gtk.gdk.color_parse (color))
-    self._vte.set_colors (fg_color, bg_color, palette)
-
-    # Set our cursor blinkiness
-    self._vte.set_cursor_blinks = (self.gconf_client.get_bool (self.profile + "/cursor_blinks") or self.defaults['cursor_blinks'])
-
-    # Set our audible belliness
-    self._vte.set_audible_bell = not (self.gconf_client.get_bool (self.profile + "/silent_bell") or self.defaults['audible_bell'])
-    self._vte.set_visible_bell (self.defaults['visible_bell'])
-
-    # Set our scrolliness
-    self._vte.set_scrollback_lines (self.gconf_client.get_int (self.profile + "/scrollback_lines") or self.defaults['scrollback_lines'])
-    self._vte.set_scroll_on_keystroke (self.gconf_client.get_bool (self.profile + "/scroll_on_keystroke") or self.defaults['scroll_on_keystroke'])
-    self._vte.set_scroll_on_output (self.gconf_client.get_bool (self.profile + "/scroll_on_output") or self.defaults['scroll_on_output'])
-
-    # Set our sloppiness
-    self.focus = self.gconf_client.get_string ("/apps/metacity/general/focus_mode") or self.defaults['focus']
-
-  def on_gconf_notification (self, client, cnxn_id, entry, what):
-    self.reconfigure_vte ()
-
-  def on_vte_button_press (self, term, event):
-    # Left mouse button should transfer focus to this vte widget
-    if event.button == 1:
-      self._vte.grab_focus ()
-      return False
-
-    # Right mouse button should display a context menu
-    if event.button == 3:
-      self.do_popup (event)
-      return True
-
-  def on_vte_notify_enter (self, term, event):
-    if (self.focus == "sloppy" or self.focus == "mouse"):
-      term.grab_focus ()
-      return False
-
-  def do_scrollbar_toggle (self):
-    if self._scrollbar.get_property ('visible'):
-      self._scrollbar.hide ()
-    else:
-      # We need to make the terminal narrower by the width of the scrollbar
-      self._vte.set_size (self._vte.get_column_count () - int(math.ceil(self._scrollbar.allocation.width / self._vte.get_char_width ())), self._vte.get_row_count ())
-      self._scrollbar.show ()
-
-  def on_vte_key_press (self, term, event):
-    keyname = gtk.gdk.keyval_name (event.keyval)
-    mask = gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK
-
-    if (event.state & mask) == mask:
-      if keyname == 'N':
-        self.term.go_next (self)
-        return (True)
-      elif keyname == "P":
-        self.term.go_prev (self)
-        return (True)
-      elif keyname == 'H':
-        self.term.splitaxis (self, False)
-        return (True)
-      elif keyname == 'V':
-        self.term.splitaxis (self, True)
-        return (True)
-      elif keyname == 'W':
-        self.term.closeterm (self)
-        return (True)
-
-    if keyname and (keyname == 'Tab' or keyname.endswith('_Tab')):
-        if event.state == gtk.gdk.CONTROL_MASK:
-            self.term.go_next (self)
-            return (True)
-        if (event.state & mask) == mask:
-            self.term.go_prev (self)
-            return (True)
-
-    return (False)
-
-  def on_vte_popup_menu (self, term):
-    self.do_popup ()
-
-  def do_popup (self, event = None):
-    menu = self.create_popup_menu (event)
-    menu.popup (None, None, None, event.button, event.time)
-
-  def create_popup_menu (self, event):
-    menu = gtk.Menu ()
-
-    url = self._vte.match_check (int (event.x / self._vte.get_char_width ()), int (event.y / self._vte.get_char_height ()))
-    if url:
-      if url[1] != self.matches['email']:
-        address = url[0]
-        nameopen = _("_Open Link")
-        namecopy = _("_Copy Link Address")
-      else:
-        if url[0][0:7] != "mailto:":
-          address = "mailto:" + url[0]
-        else:
-          address = url[0]
-        nameopen = _("_Send Mail To...")
-        namecopy = _("_Copy Email Address")
-
-      item = gtk.MenuItem (nameopen)
-      item.connect ("activate", lambda menu_item: gnome.url_show (address))
-      menu.append (item)
-
-      item = gtk.MenuItem (namecopy)
-      item.connect ("activate", lambda menu_item: self.clipboard.set_text (url[0]))
-      menu.append (item)
-
-      item = gtk.MenuItem ()
-      menu.append (item)
-
-    item = gtk.ImageMenuItem (gtk.STOCK_COPY)
-    item.connect ("activate", lambda menu_item: self._vte.copy_clipboard ())
-    item.set_sensitive (self._vte.get_has_selection ())
-    menu.append (item)
-
-    item = gtk.ImageMenuItem (gtk.STOCK_PASTE)
-    item.connect ("activate", lambda menu_item: self._vte.paste_clipboard ())
-    menu.append (item)
-
-    item = gtk.MenuItem ()
-    menu.append (item)
-
-    item = gtk.CheckMenuItem (_("Show scrollbar"))
-    item.set_active (self._scrollbar.get_property ('visible'))
-    item.connect ("toggled", lambda menu_item: self.do_scrollbar_toggle ())
-    menu.append (item)
-
-    item = gtk.MenuItem ()
-    menu.append (item)
-
-    item = gtk.MenuItem (_("Split _Horizontally"))
-    item.connect ("activate", lambda menu_item: self.term.splitaxis (self, False))
-    menu.append (item)
-
-    item = gtk.MenuItem (_("Split _Vertically"))
-    item.connect ("activate", lambda menu_item: self.term.splitaxis (self, True))
-    menu.append (item)
-
-    item = gtk.MenuItem ()
-    menu.append (item)
-
-    item = gtk.ImageMenuItem (gtk.STOCK_CLOSE)
-    item.connect ("activate", lambda menu_item: self.term.closeterm (self))
-    menu.append (item)
-
-    menu.show_all ()
-    return menu
-
-  def get_box (self):
-    return self._box
-
-class Terminator:
-  def __init__ (self, profile):
-    self.profile = profile
-    self.gconf_client = gconf.client_get_default ()
-
-    self._fullscreen = False
-
-    self.window = gtk.Window ()
-    self.icon = self.window.render_icon (gtk.STOCK_DIALOG_INFO, gtk.ICON_SIZE_BUTTON)
-    self.window.set_icon (self.icon)
-
-    self.window.connect ("key-press-event", self.on_key_press)
-    self.window.connect ("delete_event", self.on_delete_event)
-    self.window.connect ("destroy", self.on_destroy_event)
-
-    self.window.set_property ('allow-shrink', True)
-
-    # Start out with just one terminal
-    # FIXME: This should be really be decided from some kind of profile
-    term = (TerminatorTerm (self, self.profile))
-    self.term_list = [term]
-
-    self.window.add (term.get_box ())
-    self.window.show_all ()
-
-  def maximize (self):
-    """ Maximize the Terminator."""
-    self.window.maximize ()
-
-  def toggle_fullscreen (self):
-    """ Toggle the fullscreen state of the window. If it is in
-        fullscreen state, it will be unfullscreened. If it is not, it
-        will be set to fullscreen state.
-    """
-    if self._fullscreen:
-      self.window.unfullscreen ()
-    else:
-      self.window.fullscreen ()
-    self._fullscreen = not self._fullscreen
-
-  def on_delete_event (self, window, event, data=None):
-    if len (self.term_list) == 1:
-      return False
-
-    # show dialog
-    dialog = gtk.Dialog (_("Close?"), window, gtk.DIALOG_MODAL,
-      (gtk.STOCK_CANCEL, gtk.RESPONSE_REJECT, gtk.STOCK_CLOSE, gtk.RESPONSE_ACCEPT))
-    dialog.set_has_separator (False)
-    dialog.set_resizable (False)
-
-    primairy = gtk.Label (_('<big><b>Close all terminals?</b></big>'))
-    primairy.set_use_markup (True)
-    primairy.set_alignment (0, 0.5)
-    secundairy = gtk.Label (_("This window has %s terminals open.  Closing the window will also close all terminals.") % len(self.term_list))
-    secundairy.set_line_wrap(True)
-    primairy.set_alignment (0, 0.5)
-
-    labels = gtk.VBox ()
-    labels.pack_start (primairy, False, False, 6)
-    labels.pack_start (secundairy, False, False, 6)
-
-    image = gtk.image_new_from_stock(gtk.STOCK_DIALOG_WARNING, gtk.ICON_SIZE_DIALOG)
-    image.set_alignment (0.5, 0)
-
-    box = gtk.HBox()
-    box.pack_start (image, False, False, 6)
-    box.pack_start (labels, False, False, 6)
-    dialog.vbox.pack_start (box, False, False, 12)
-
-    dialog.show_all ()
-    result = dialog.run ()
-    dialog.destroy ()
-    return not (result == gtk.RESPONSE_ACCEPT)
-
-  def on_destroy_event (self, widget, data=None):
-    gtk.main_quit ()
-
-  def on_key_press (self, window, event):
-    """ Callback for the window to determine what to do with special
-        keys. Currently handled key-combo's:
-          * CTRL - SHIFT - F : toggle fullscreen state of the window.
-    """
-    keyname = gtk.gdk.keyval_name (event.keyval)
-    mask = gtk.gdk.CONTROL_MASK | gtk.gdk.SHIFT_MASK
-
-    if (event.state & mask) == mask:
-      if keyname == 'F':
-        self.toggle_fullscreen ()
-        return (True)
-      if keyname == 'Q':
-        if not self.on_delete_event (window, gtk.gdk.Event (gtk.gdk.DELETE)):
-          self.on_destroy_event (window, gtk.gdk.Event (gtk.gdk.DESTROY))
-        
-
-  def splitaxis (self, widget, vert=True):
-    term2 = TerminatorTerm (self, self.profile)
-
-    parent = widget.get_box ().get_parent ()
-
-    if vert:
-      pane = gtk.VPaned ()
-    else:
-      pane = gtk.HPaned ()
-
-    # VTE doesn't seem to cope well with being resized by the window manager. I expect I am supposed to send some kind of WINCH, or just generally connect window resizing events to a callback that will often tell vte about the new size. For now, cheat. Badly.
-    cols = widget._vte.get_column_count ()
-    rows = widget._vte.get_row_count ()
-    allowance = widget._scrollbar.allocation.width + pane.style_get_property ('handle-size')
-
-    if vert:
-      width = cols
-      height = (rows / 2) - (allowance / widget._vte.get_char_height ())
-    else:
-      width = (cols / 2) - (allowance / widget._vte.get_char_width ())
-      height = rows
-
-    widget._vte.set_size (width, height)
-    term2._vte.set_size (width, height)
-
-    if isinstance (parent, gtk.Window):
-      # We have just one term
-      if vert:
-        newpos = parent.allocation.height / 2
-      else:
-        newpos = parent.allocation.width / 2
-
-      widget.get_box ().reparent (pane)
-
-      pane.pack1 (widget.get_box (), True, True)
-      pane.pack2 (term2.get_box (), True, True)
-
-      parent.add (pane)
-      pane.set_position (newpos)
-
-    if isinstance (parent, gtk.Paned):
-      # We are inside a split term
-      if vert:
-        term2._vte.set_size (cols, (rows / 2) - 1)
-
-      if (widget.get_box () == parent.get_child1 ()):
-        widget.get_box ().reparent (pane)
-        parent.pack1 (pane, True, True)
-      else:
-        widget.get_box ().reparent (pane)
-        parent.pack2 (pane, True, True)
-
-      pane.pack1 (widget.get_box (), True, True)
-      pane.pack2 (term2.get_box (), True, True)
-
-    pane.show ()
-    term2.get_box ().show ()
-    # insert the term reference into the list
-    index = self.term_list.index (widget)
-    self.term_list.insert (index + 1, term2)
-    widget._vte.grab_focus ()
-
-    return (term2)
-
-  def closeterm (self, widget):
-    parent = widget.get_box ().get_parent ()
-    sibling = None
-
-    if isinstance (parent, gtk.Window):
-      # We are the only term
-      if not self.on_delete_event (parent, gtk.gdk.Event (gtk.gdk.DELETE)):
-        self.on_destroy_event (parent, gtk.gdk.Event (gtk.gdk.DESTROY))
-      return
-
-    if isinstance (parent, gtk.Paned):
-      index = self.term_list.index (widget)
-      grandparent = parent.get_parent ()
-
-      # Discover sibling while all objects exist
-      if widget.get_box () == parent.get_child1 ():
-        sibling = parent.get_child2 ()
-      if widget.get_box () == parent.get_child2 ():
-        sibling = parent.get_child1 ()
-
-      if not sibling:
-        # something is wrong, give up
-        print "Error: %s is not a child of %s"%(widget, parent)
-        return
-
-      self.term_list.remove (widget)
-      grandparent.remove (parent)
-      sibling.reparent (grandparent)
-      widget.get_box ().destroy ()
-      parent.destroy ()
-
-      if not isinstance (sibling, gtk.Paned):
-        for term in self.term_list:
-          if term.get_box () == sibling:
-            term._vte.grab_focus ()
-            break
-      else:
-        if index == 0: index = 1
-        self.term_list[index - 1]._vte.grab_focus ()
-
-    return
-
-  def go_next (self, term):
-    current = self.term_list.index (term)
-    next = current
-
-    if current == len (self.term_list) - 1:
-      next = 0
-    else:
-      next += 1
-
-    self.term_list[next]._vte.grab_focus ()
-
-  def go_prev (self, term):
-    current = self.term_list.index (term)
-    previous = current
-
-    if current == 0:
-      previous = len (self.term_list) - 1
-    else:
-      previous -= 1
-
-    self.term_list[previous]._vte.grab_focus ()
-
-def usage ():
-  """ Print information on how to use this program. """
-  print __doc__
+    ORIGCWD = os.getcwd()
+except OSError:
+    ORIGCWD = os.path.expanduser("~")
+
+# Check we have simple basics like Gtk+ and a valid $DISPLAY
+try:
+    import gi
+    gi.require_version('Gtk','3.0')
+    # pylint: disable-msg=W0611
+    from gi.repository import Gtk, Gdk
+
+    if Gdk.Display.get_default() == None:
+        print('You need to run terminator in an X environment. ' \
+              'Make sure $DISPLAY is properly set')
+        sys.exit(1)
+
+except ImportError:
+    print('You need to install the python bindings for ' \
+           'gobject, gtk and pango to run Terminator.')
+    sys.exit(1)
+
+import terminatorlib.optionparse
+from terminatorlib.terminator import Terminator
+from terminatorlib.factory import Factory
+from terminatorlib.version import APP_NAME, APP_VERSION
+from terminatorlib.util import dbg, err
+from terminatorlib.layoutlauncher import LayoutLauncher
 
 if __name__ == '__main__':
+    # Workaround for IBus intefering with broadcast when using dead keys
+    # Environment also needs IBUS_DISABLE_SNOOPER=1, or double chars appear
+    # in the receivers.
+    username = pwd.getpwuid(os.getuid()).pw_name
+    ibus_running = [p for p in psutil.process_iter() if p.name == 'ibus-daemon' and p.username == username]
+    ibus_running = len(ibus_running) > 0
+    if ibus_running:
+        os.environ['IBUS_DISABLE_SNOOPER']='1'
 
-  # define the options
-  short_opts = "hdmfp:"
-  long_opts  = ["help", "debug", "maximise", "fullscreen", "profile="]
+    dbus_service = None
 
-  # parse the options
-  try:
-    opts, args = getopt.getopt (sys.argv[1:], short_opts, long_opts)
-  except getopt.GetoptError:
-    usage ()
-    sys.exit (2)
+    dbg ("%s starting up, version %s" % (APP_NAME, APP_VERSION))
+  
+    OPTIONS = terminatorlib.optionparse.parse_options()
 
-  # set some default values
-  debug = 0
-  profile = "Default"
-  maximise = False
-  fullscreen = False
+    if OPTIONS.select:
+        # launch gui, return selection
+        LAYOUTLAUNCHER=LayoutLauncher()
+    else:
+        # Attempt to import our dbus server. If one exists already we will just
+        # connect to that and ask for a new window. If not, we will create one and
+        # continue. Failure to import dbus, or the global config option "dbus"
+        # being False will cause us to continue without the dbus server and open a
+        # window.
+        try:
+            if OPTIONS.nodbus:
+                dbg('dbus disabled by command line')
+                raise ImportError
+            from terminatorlib import ipc
+            import dbus
+            try:
+                dbus_service = ipc.DBusService()
+            except ipc.DBusException:
+                dbg('Unable to become master process, operating via DBus')
+                # get rid of the None and True types so dbus can handle them (empty
+                # and 'True' strings are used instead), also arrays are joined 
+                # (the -x argument for example)
+                if OPTIONS.working_directory is None:
+                    OPTIONS.working_directory = ORIGCWD
+                optionslist = {}
+                for opt, val in OPTIONS.__dict__.items():
+                    if type(val) == type([]):
+                        val = ' '.join(val)
+                    if val == True:
+                        val = 'True'
+                    optionslist[opt] = val and '%s'%val or ''
+                optionslist = dbus.Dictionary(optionslist, signature='ss')
+                if OPTIONS.new_tab:
+                    dbg('Requesting a new tab')
+                    ipc.new_tab_cmdline(optionslist)
+                else:
+                    dbg('Requesting a new window')
+                    ipc.new_window_cmdline(optionslist)
+                sys.exit()
+        except ImportError:
+            dbg('dbus not imported')
+            pass
 
-  # check the options
-  for opt, arg in opts:
-    if opt in ("-h", "--help"):
-      usage ()
-      sys.exit (0)
-    if opt in ("-d", "--debug"):
-      debug = 1
-    if opt in ("-m", "--maximise"):
-      maximise = True
-    if opt in ("-f", "--fullscreen"):
-      fullscreen = True
-    if opt in ("-p", "--profile"):
-      profile = arg
+        MAKER = Factory()
+        TERMINATOR = Terminator()
+        TERMINATOR.set_origcwd(ORIGCWD)
+        TERMINATOR.set_dbus_data(dbus_service)
+        TERMINATOR.reconfigure()
+        TERMINATOR.ibus_running = ibus_running
 
-  gettext.install ('terminator')
-  term = Terminator (profile)
+        try:
+            dbg('Creating a terminal with layout: %s' % OPTIONS.layout)
+            TERMINATOR.create_layout(OPTIONS.layout)
+        except (KeyError,ValueError), ex:
+            err('layout creation failed, creating a window ("%s")' % ex)
+            TERMINATOR.new_window()
+        TERMINATOR.layout_done()
 
-  # Set the Terminator in fullscreen state or maximize it.
-  # Fullscreen and maximise are mutually exclusive, with
-  # fullscreen taking precedence over maximise.
-  if fullscreen:
-    term.toggle_fullscreen ()
-  elif maximise:
-    term.maximize ()
+    if OPTIONS.debug >= 2:
+        import terminatorlib.debugserver as debugserver
+        # pylint: disable-msg=W0611
+        import threading
 
-  gtk.main ()
+        Gdk.threads_init()
+        (DEBUGTHREAD, DEBUGSVR) = debugserver.spawn(locals())
+        TERMINATOR.debug_address = DEBUGSVR.server_address
+
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
 
